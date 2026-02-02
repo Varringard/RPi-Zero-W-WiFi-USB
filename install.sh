@@ -1,71 +1,166 @@
 #!/bin/bash
 
 # Configuration Variables
-USB_FILE_SIZE_MB=8192  # 8 ГБ — измените при необходимости
-REQUIRED_SPACE_MB=$((USB_FILE_SIZE_MB + 1024))
+USB_FILE_SIZE_MB=2048 # Size of the USB file in Megabytes
+REQUIRED_SPACE_MB=$((USB_FILE_SIZE_MB + 1024)) # Required space including buffer
 MOUNT_FOLDER="/mnt/usb_share"
+USE_EXISTING_FOLDER="no"
+DRIVER_TO_USE="g_multi"
+if [[ "g_mass_storage" = "$1" ]]; then
+    DRIVER_TO_USE="g_mass_storage"
+fi
+
 
 # Known compatible hardware models
 COMPATIBLE_MODELS=("Raspberry Pi Zero W Rev 1.1" "Raspberry Pi Zero 2 W Rev 1.0")
-HARDWARE_MODEL=$(cat /proc/device-tree/model)
-
-is_model_compatible() {
-    for model in "${COMPATIBLE_MODELS[@]}"; do
-        if [[ "$model" == "$1" ]]; then
-            return 0
-        fi
-    done
-    return 1
+# Function to install packages and check for errors
+install_packages() {
+    # Install new packages
+    sudo apt-get install -y samba winbind python3-pip python3-watchdog
+    return $? # Return the exit status of the last command executed
 }
 
-if is_model_compatible "$HARDWARE_MODEL"; then
-    echo "Detected compatible hardware: $HARDWARE_MODEL"
-else
-    echo "Detected hardware: $HARDWARE_MODEL"
-    echo "This model is not officially tested. Continue? (y/n)"
-    read -r choice
-    [[ ! "$choice" =~ ^[Yy]$ ]] && { echo "Aborted."; exit 1; }
-fi
-
-# Install packages
-echo "📦 Installing required packages..."
-sudo apt update && sudo apt install -y samba winbind python3 python3-watchdog
-[[ $? -ne 0 ]] && { echo "Failed to install packages."; exit 1; }
-
-# Determine boot dir
-BOOT_DIR="/boot"
-[[ -d "/boot/firmware" ]] && BOOT_DIR="/boot/firmware"
-
-# Enable dwc2
-grep -q "dtoverlay=dwc2" "$BOOT_DIR/config.txt" || echo "dtoverlay=dwc2" | sudo tee -a "$BOOT_DIR/config.txt" >/dev/null
-grep -q "^dwc2$" /etc/modules || echo "dwc2" | sudo tee -a /etc/modules >/dev/null
-
-# Disable Wi-Fi power saving (optional but recommended)
-sudo iw wlan0 set power_save off 2>/dev/null || true
-
-# Create USB image if not exists
-if [[ ! -f /piusb.bin ]]; then
-    echo "💾 Creating $((USB_FILE_SIZE_MB / 1024)) GB USB image..."
-    AVAILABLE_MB=$(( $(df --output=avail / | tail -1) / 1024 ))
-    if [[ $AVAILABLE_MB -lt $REQUIRED_SPACE_MB ]]; then
-        echo "⚠️ Not enough space. Available: ${AVAILABLE_MB} MB, Required: ${REQUIRED_SPACE_MB} MB"
-        exit 1
+# Install necessary packages
+while true; do
+    install_packages
+    if [ $? -eq 0 ]; then
+        echo "Packages installed successfully."
+        break
+    else
+        echo "An error occurred during package installation."
+        echo "Do you want to retry? (yes/no):"
+        read user_choice
+        if [[ "$user_choice" != "yes" && "$user_choice" != "y" ]]; then
+            echo "Installation aborted by the user."
+            exit 1
+        fi
     fi
-    sudo dd bs=1M if=/dev/zero of=/piusb.bin count="$USB_FILE_SIZE_MB" status=progress
-    sudo mkdosfs /piusb.bin -F 32 -I
+done
+
+# Function to append text to a file, check for existing text, and verify successful writing
+append_text_to_file() {
+    local text="$1"
+    local file="$2"
+    local identifier="$3"
+
+    # Check if the identifier is provided and exists in the file
+    if [[ -n "$identifier" && $(grep -Fxc "$identifier" "$file") -ne 0 ]]; then
+        echo "The identifier '$identifier' already exists in $file."
+        return 1
+    fi
+
+    # Append text to the file
+    echo "$text" | sudo tee -a "$file" > /dev/null
+    local status=$?
+
+    # Check if the write operation was successful
+    if [ $status -ne 0 ]; then
+        echo "Failed to write to $file."
+        return 1
+    else
+        echo "Text appended successfully to $file."
+        return 0
+    fi
+}
+
+# Determine the correct directory for boot files
+BOOT_DIR="/boot"
+if [ -d "/boot/firmware" ]; then
+    BOOT_DIR="/boot/firmware"
 fi
 
-# Mount point
-sudo mkdir -p "$MOUNT_FOLDER"
-sudo chmod 777 "$MOUNT_FOLDER"
+# Enabling USB Driver
+append_text_to_file "dtoverlay=dwc2" "$BOOT_DIR/config.txt" "dtoverlay=dwc2"
+append_text_to_file "dwc2" "/etc/modules" "dwc2"
 
-# Add to fstab (only if not present)
-grep -q "/piusb.bin.*$MOUNT_FOLDER" /etc/fstab || echo "/piusb.bin $MOUNT_FOLDER vfat users,umask=000 0 2" | sudo tee -a /etc/fstab >/dev/null
+# Carefully edit commandline.txt to append 'modules-load=dwc2' at the end of the line
+if ! grep -q "modules-load=dwc2" $BOOT_DIR/cmdline.txt; then
+    sudo sed -i '$ s/$/ modules-load=dwc2/' $BOOT_DIR/cmdline.txt && echo "Modified $BOOT_DIR/cmdline.txt successfully."
+else
+    echo "Modification already exists in $BOOT_DIR/cmdline.txt."
+fi
+
+# Function to create USB file
+create_usb_file() {
+    sudo dd bs=1M if=/dev/zero of=/piusb.bin count=$1
+    sudo mkdosfs /piusb.bin -F 32 -I
+}
+
+# Creating a USB File
+while true; do
+    AVAILABLE_SPACE_KB=$(df --output=avail / | tail -1 | xargs)
+    AVAILABLE_SPACE_MB=$((AVAILABLE_SPACE_KB / 1024))
+    MAX_POSSIBLE_FILE_SIZE_MB=$((AVAILABLE_SPACE_MB - 1024)) # Max size considering buffer
+
+    if [ ! -f "/piusb.bin" ]; then
+        if [ "$AVAILABLE_SPACE_MB" -ge "$REQUIRED_SPACE_MB" ]; then
+            create_usb_file $USB_FILE_SIZE_MB
+            break
+        else
+            echo "Not enough space available. Required: $REQUIRED_SPACE_MB MB, Available: $AVAILABLE_SPACE_MB MB"
+            echo "1. Create file with maximum available size ($MAX_POSSIBLE_FILE_SIZE_MB MB)"
+            echo "2. Enter a new size manually"
+            echo "3. Abort"
+            echo "Please choose an option (1, 2, or 3):"
+            read user_choice
+            case $user_choice in
+                1)
+                    create_usb_file $MAX_POSSIBLE_FILE_SIZE_MB
+                    break
+                    ;;
+                2)
+                    echo "Enter the new size in MB (less than $MAX_POSSIBLE_FILE_SIZE_MB):"
+                    read new_size
+                    USB_FILE_SIZE_MB=$new_size
+                    REQUIRED_SPACE_MB=$((USB_FILE_SIZE_MB + 1024))
+                    ;;
+                3)
+                    echo "USB file creation aborted."
+                    exit 1
+                    ;;
+                *)
+                    echo "Invalid option. Please try again."
+                    ;;
+            esac
+        fi
+    else
+        echo "/piusb.bin already exists"
+        break
+    fi
+done
+
+# Mounting USB File
+if [ -d "$MOUNT_FOLDER" ]; then
+    echo "Mount folder $MOUNT_FOLDER already exists."
+    echo "Do you want to use this existing folder? (y/n)"
+    read use_existing
+    if [[ "$use_existing" =~ ^(yes|y)$ ]]; then
+        USE_EXISTING_FOLDER="yes"
+    else
+        echo "Do you want to create a different folder? (y/n)"
+        read create_new
+        if [[ "$create_new" =~ ^(yes|y)$ ]]; then
+            echo "Enter the name for the new mount folder (e.g., /mnt/new_folder):"
+            read new_folder
+            MOUNT_FOLDER=$new_folder
+            sudo mkdir "$MOUNT_FOLDER"
+            sudo chmod 777 "$MOUNT_FOLDER"
+        else
+            echo "Mounting process aborted."
+            exit 1
+        fi
+    fi
+fi
+
+if [ "$USE_EXISTING_FOLDER" = "no" ]; then
+    sudo mkdir "$MOUNT_FOLDER"
+    sudo chmod 777 "$MOUNT_FOLDER"
+fi
+append_text_to_file "/piusb.bin $MOUNT_FOLDER vfat users,umask=000 0 2" "/etc/fstab" "/piusb.bin $MOUNT_FOLDER vfat users,umask=000 0 2"
 sudo mount -a
 
 # Configure Samba
-cat <<'EOF' | sudo tee -a /etc/samba/smb.conf >/dev/null
-
+samba_block=$(cat <<'EOT'
 [usb]
     browseable = yes
     path = /mnt/usb_share
@@ -73,92 +168,67 @@ cat <<'EOF' | sudo tee -a /etc/samba/smb.conf >/dev/null
     read only = no
     create mask = 777
     directory mask = 777
-EOF
+EOT
+)
+append_text_to_file "$samba_block" "/etc/samba/smb.conf" "[usb]"
 
+# Restart Samba services
 sudo systemctl restart smbd
+ACTIVE_STATUS=$(systemctl is-active usbshare.service)
+if [[ "$ACTIVE_STATUS" = "active" ]]; then
+    echo "Service is currently active, shutting down"
+    sudo systemctl stop usbshare.service
+    sudo systemctl disable usbshare.service
+    sudo modprobe g_multi -r
+    sudo modprobe g_mass_storage -r
+    sudo systemctl daemon-reload
+fi
+# Copy usbshare.py script
+if [ -f "usbshare.py" ]; then
+    sudo cp usbshare.py /usr/local/share/usbshare.py
+    sudo chmod +x /usr/local/share/usbshare.py
+    if [[ "$DRIVER_TO_USE" = "g_mass_storage" ]]; then
+        sudo sed -i 's/g_multi/g_mass_storage/g' /usr/local/share/usbshare.py
+    fi
+else
+    echo "usbshare.py not found"
+    exit 1
+fi
 
-# Create watchdog script
-cat <<'EOF' | sudo tee /usr/local/share/usbshare.py >/dev/null
-#!/usr/bin/python3
-import time
-import os
-import subprocess
-from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler
-
-CMD_UNMOUNT = "modprobe -r g_mass_storage"
-CMD_MOUNT   = "modprobe g_mass_storage file=/piusb.bin stall=0 removable=y"
-WATCH_PATH  = "/mnt/usb_share"
-TIMEOUT     = 5
-
-class Handler(FileSystemEventHandler):
-    def __init__(self):
-        self.dirty = False
-        self.last_event = 0
-
-    def on_any_event(self, event):
-        if not event.is_directory:
-            self.dirty = True
-            self.last_event = time.time()
-
-def run_cmd(cmd):
-    subprocess.run(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-event_handler = Handler()
-observer = Observer()
-observer.schedule(event_handler, path=WATCH_PATH, recursive=False)
-observer.start()
-
-# Initial mount
-run_cmd(CMD_MOUNT)
-
-try:
-    while True:
-        if event_handler.dirty and (time.time() - event_handler.last_event) >= TIMEOUT:
-            run_cmd(CMD_UNMOUNT)
-            time.sleep(1)
-            run_cmd("sync")
-            time.sleep(1)
-            run_cmd(CMD_MOUNT)
-            event_handler.dirty = False
-        time.sleep(1)
-except KeyboardInterrupt:
-    observer.stop()
-observer.join()
-EOF
-
-sudo chmod +x /usr/local/share/usbshare.py
-
-# Create systemd service
-cat <<'EOF' | sudo tee /etc/systemd/system/usbshare.service >/dev/null
+# Create systemd service for usbshare.py
+usbshare_service_block=$(cat <<'EOT'
 [Unit]
-Description=USB Mass Storage Watchdog
+Description=Watchdog for USB Share
 After=multi-user.target
 
 [Service]
-Type=simple
+Type=idle
 ExecStart=/usr/bin/python3 /usr/local/share/usbshare.py
-Restart=always
-User=root
 
 [Install]
 WantedBy=multi-user.target
-EOF
+EOT
+)
+append_text_to_file "$usbshare_service_block" "/etc/systemd/system/usbshare.service" "[Unit]"
 
+# Enable and start the service
 sudo systemctl daemon-reload
-sudo systemctl enable --now usbshare.service
+sudo systemctl enable usbshare.service
+sudo systemctl start usbshare.service
 
-echo
-echo "✅ Setup complete!"
-echo "• USB Mass Storage: enabled (no Ethernet/RNDIS)"
-echo "• Samba share: \\\\$(hostname).local\\usb"
-echo "• Image: /piusb.bin (8 GB FAT32)"
-echo
-echo "🔌 Connect Pi to dermatoscope via RIGHT microUSB port."
-echo "💻 Access files from PC via Samba share."
-echo
-read -p "Reboot now? (y/n): " -n 1 -r
-echo
-if [[ $REPLY =~ ^[Yy]$ ]]; then
-    sudo reboot
+# Feedback request for new hardware models
+if [ "$COMPATIBILITY_CHECK_PASSED" = false ]; then
+    echo "It looks like you ran this script on a different hardware model."
+    echo "If everything worked as expected, please consider creating a new issue in the repository:"
+    echo "https://github.com/mrfenyx/RPi-Zero-W-WiFi-USB"
+    echo "This will help us to update the list of known compatible models. Thank you!"
+fi
+
+# Optional reboot
+echo "Setup complete. It's recommended to reboot the system. Do you want to reboot now? (y/n)"
+read reboot_choice
+if [[ "$reboot_choice" =~ ^(yes|y)$ ]]; then
+  sudo reboot
+else
+  echo "Reboot cancelled. Please reboot manually later."
 fi
