@@ -1,234 +1,271 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -euo pipefail
 
-# Configuration Variables
-USB_FILE_SIZE_MB=2048 # Size of the USB file in Megabytes
-REQUIRED_SPACE_MB=$((USB_FILE_SIZE_MB + 1024)) # Required space including buffer
-MOUNT_FOLDER="/mnt/usb_share"
-USE_EXISTING_FOLDER="no"
-DRIVER_TO_USE="g_multi"
-if [[ "g_mass_storage" = "$1" ]]; then
-    DRIVER_TO_USE="g_mass_storage"
+echo "============================================================="
+echo " Настройка Raspberry Pi для дерматоскопа (интерактивная версия)"
+echo "============================================================="
+echo
+
+# ──────────────────────────────────────────────────────────────
+# Вопросы пользователю
+# ──────────────────────────────────────────────────────────────
+
+read -p "Обновить систему (apt update + upgrade)? [y/N]: " -n 1 -r UPDATE_SYSTEM
+echo
+UPDATE_SYSTEM=${UPDATE_SYSTEM:-N}
+[[ $UPDATE_SYSTEM =~ ^[Yy]$ ]] && UPDATE_SYSTEM=true || UPDATE_SYSTEM=false
+
+read -p "Сколько ГБ выделить под USB-образ? (рекомендуется 4–32, по умолчанию 8): " -r IMG_SIZE_GB
+IMG_SIZE_GB=${IMG_SIZE_GB:-8}
+if ! [[ "$IMG_SIZE_GB" =~ ^[0-9]+$ ]] || (( IMG_SIZE_GB < 1 )); then
+    echo "Некорректный размер → использую 8 ГБ"
+    IMG_SIZE_GB=8
 fi
 
+read -p "Название папки для хранения файлов на Raspberry Pi (по умолчанию: derma_share): " -r SMB_DIR_NAME
+SMB_DIR_NAME=${SMB_DIR_NAME:-derma_share}
+SMB_DIR="/home/pi/$SMB_DIR_NAME"
 
-# Known compatible hardware models
-COMPATIBLE_MODELS=("Raspberry Pi Zero W Rev 1.1" "Raspberry Pi Zero 2 W Rev 1.0")
-# Function to install packages and check for errors
-install_packages() {
-    # Install new packages
-    sudo apt-get install -y samba winbind python3-pip python3-watchdog
-    return $? # Return the exit status of the last command executed
-}
+read -p "Имя сетевой шары (как будет видно в сети, например derma, photos): " -r SHARE_NAME
+SHARE_NAME=${SHARE_NAME:-derma}
 
-# Install necessary packages
-while true; do
-    install_packages
-    if [ $? -eq 0 ]; then
-        echo "Packages installed successfully."
-        break
-    else
-        echo "An error occurred during package installation."
-        echo "Do you want to retry? (yes/no):"
-        read user_choice
-        if [[ "$user_choice" != "yes" && "$user_choice" != "y" ]]; then
-            echo "Installation aborted by the user."
-            exit 1
-        fi
-    fi
-done
-
-# Function to append text to a file, check for existing text, and verify successful writing
-append_text_to_file() {
-    local text="$1"
-    local file="$2"
-    local identifier="$3"
-
-    # Check if the identifier is provided and exists in the file
-    if [[ -n "$identifier" && $(grep -Fxc "$identifier" "$file") -ne 0 ]]; then
-        echo "The identifier '$identifier' already exists in $file."
-        return 1
-    fi
-
-    # Append text to the file
-    echo "$text" | sudo tee -a "$file" > /dev/null
-    local status=$?
-
-    # Check if the write operation was successful
-    if [ $status -ne 0 ]; then
-        echo "Failed to write to $file."
-        return 1
-    else
-        echo "Text appended successfully to $file."
-        return 0
-    fi
-}
-
-# Determine the correct directory for boot files
-BOOT_DIR="/boot"
-if [ -d "/boot/firmware" ]; then
-    BOOT_DIR="/boot/firmware"
+read -p "Сколько минут между синхронизациями? (1–60, по умолчанию 1): " -r SYNC_MINUTES
+SYNC_MINUTES=${SYNC_MINUTES:-1}
+if ! [[ "$SYNC_MINUTES" =~ ^[0-9]+$ ]] || (( SYNC_MINUTES < 1 )) || (( SYNC_MINUTES > 60 )); then
+    echo "Некорректное значение → использую 1 минуту"
+    SYNC_MINUTES=1
 fi
 
-# Enabling USB Driver
-append_text_to_file "dtoverlay=dwc2" "$BOOT_DIR/config.txt" "dtoverlay=dwc2"
-append_text_to_file "dwc2" "/etc/modules" "dwc2"
-
-# Carefully edit commandline.txt to append 'modules-load=dwc2' at the end of the line
-if ! grep -q "modules-load=dwc2" $BOOT_DIR/cmdline.txt; then
-    sudo sed -i '$ s/$/ modules-load=dwc2/' $BOOT_DIR/cmdline.txt && echo "Modified $BOOT_DIR/cmdline.txt successfully."
-else
-    echo "Modification already exists in $BOOT_DIR/cmdline.txt."
+read -s -p "Установите пароль для Samba-доступа (пользователь pi): " -r SAMBA_PASSWORD
+echo
+read -s -p "Повторите пароль: " -r SAMBA_PASSWORD2
+echo
+if [[ "$SAMBA_PASSWORD" != "$SAMBA_PASSWORD2" ]]; then
+    echo "Пароли не совпадают! Завершаем."
+    exit 1
 fi
-
-# Function to create USB file
-create_usb_file() {
-    sudo dd bs=1M if=/dev/zero of=/piusb.bin count=$1
-    sudo mkdosfs /piusb.bin -F 32 -I
-}
-
-# Creating a USB File
-while true; do
-    AVAILABLE_SPACE_KB=$(df --output=avail / | tail -1 | xargs)
-    AVAILABLE_SPACE_MB=$((AVAILABLE_SPACE_KB / 1024))
-    MAX_POSSIBLE_FILE_SIZE_MB=$((AVAILABLE_SPACE_MB - 1024)) # Max size considering buffer
-
-    if [ ! -f "/piusb.bin" ]; then
-        if [ "$AVAILABLE_SPACE_MB" -ge "$REQUIRED_SPACE_MB" ]; then
-            create_usb_file $USB_FILE_SIZE_MB
-            break
-        else
-            echo "Not enough space available. Required: $REQUIRED_SPACE_MB MB, Available: $AVAILABLE_SPACE_MB MB"
-            echo "1. Create file with maximum available size ($MAX_POSSIBLE_FILE_SIZE_MB MB)"
-            echo "2. Enter a new size manually"
-            echo "3. Abort"
-            echo "Please choose an option (1, 2, or 3):"
-            read user_choice
-            case $user_choice in
-                1)
-                    create_usb_file $MAX_POSSIBLE_FILE_SIZE_MB
-                    break
-                    ;;
-                2)
-                    echo "Enter the new size in MB (less than $MAX_POSSIBLE_FILE_SIZE_MB):"
-                    read new_size
-                    USB_FILE_SIZE_MB=$new_size
-                    REQUIRED_SPACE_MB=$((USB_FILE_SIZE_MB + 1024))
-                    ;;
-                3)
-                    echo "USB file creation aborted."
-                    exit 1
-                    ;;
-                *)
-                    echo "Invalid option. Please try again."
-                    ;;
-            esac
-        fi
-    else
-        echo "/piusb.bin already exists"
-        break
-    fi
-done
-
-# Mounting USB File
-if [ -d "$MOUNT_FOLDER" ]; then
-    echo "Mount folder $MOUNT_FOLDER already exists."
-    echo "Do you want to use this existing folder? (y/n)"
-    read use_existing
-    if [[ "$use_existing" =~ ^(yes|y)$ ]]; then
-        USE_EXISTING_FOLDER="yes"
-    else
-        echo "Do you want to create a different folder? (y/n)"
-        read create_new
-        if [[ "$create_new" =~ ^(yes|y)$ ]]; then
-            echo "Enter the name for the new mount folder (e.g., /mnt/new_folder):"
-            read new_folder
-            MOUNT_FOLDER=$new_folder
-            sudo mkdir "$MOUNT_FOLDER"
-            sudo chmod 777 "$MOUNT_FOLDER"
-        else
-            echo "Mounting process aborted."
-            exit 1
-        fi
-    fi
-fi
-
-if [ "$USE_EXISTING_FOLDER" = "no" ]; then
-    sudo mkdir "$MOUNT_FOLDER"
-    sudo chmod 777 "$MOUNT_FOLDER"
-fi
-append_text_to_file "/piusb.bin $MOUNT_FOLDER vfat users,umask=000 0 2" "/etc/fstab" "/piusb.bin $MOUNT_FOLDER vfat users,umask=000 0 2"
-sudo mount -a
-
-# Configure Samba
-samba_block=$(cat <<'EOT'
-[usb]
-    browseable = yes
-    path = /mnt/usb_share
-    guest ok = yes
-    read only = no
-    create mask = 777
-    directory mask = 777
-EOT
-)
-append_text_to_file "$samba_block" "/etc/samba/smb.conf" "[usb]"
-
-# Restart Samba services
-sudo systemctl restart smbd
-ACTIVE_STATUS=$(systemctl is-active usbshare.service)
-if [[ "$ACTIVE_STATUS" = "active" ]]; then
-    echo "Service is currently active, shutting down"
-    sudo systemctl stop usbshare.service
-    sudo systemctl disable usbshare.service
-    sudo modprobe g_multi -r
-    sudo modprobe g_mass_storage -r
-    sudo systemctl daemon-reload
-fi
-# Copy usbshare.py script
-if [ -f "usbshare.py" ]; then
-    sudo cp usbshare.py /usr/local/share/usbshare.py
-    sudo chmod +x /usr/local/share/usbshare.py
-    if [[ "$DRIVER_TO_USE" = "g_mass_storage" ]]; then
-        sudo sed -i 's/g_multi/g_mass_storage/g' /usr/local/share/usbshare.py
-    fi
-else
-    echo "usbshare.py not found"
+if [[ -z "$SAMBA_PASSWORD" ]]; then
+    echo "Пароль не может быть пустым!"
     exit 1
 fi
 
-# Create systemd service for usbshare.py
-usbshare_service_block=$(cat <<'EOT'
+echo
+echo "Настройки, которые будут применены:"
+echo "• Обновление системы:          $( [[ $UPDATE_SYSTEM = true ]] && echo "Да" || echo "Нет" )"
+echo "• Размер USB-образа:           ${IMG_SIZE_GB} ГБ"
+echo "• Папка на Pi:                 $SMB_DIR"
+echo "• Имя шары в сети:             $SHARE_NAME"
+echo "• Интервал синхронизации:      каждые $SYNC_MINUTES минут"
+echo "• Пароль Samba для pi:         (скрыт)"
+echo
+read -p "Всё верно? Продолжить? [Y/n]: " -n 1 -r CONFIRM
+echo
+[[ $CONFIRM =~ ^[Nn]$ ]] && { echo "Отменено."; exit 0; }
+
+# ──────────────────────────────────────────────────────────────
+# Основная настройка
+# ──────────────────────────────────────────────────────────────
+
+IMG="/home/pi/piusb.bin"
+MOUNT_PT="/mnt/usb_tmp"
+SYNC_SCRIPT="/home/pi/sync_from_usb.sh"
+GADGET_SCRIPT="/home/pi/setup_usb_gadget.sh"
+
+# 1. Обновление системы (если выбрано)
+if $UPDATE_SYSTEM; then
+    echo "📦 Обновление системы..."
+    sudo apt update -qq
+    sudo apt upgrade -y
+fi
+
+# 2. Установка пакетов
+echo "📦 Установка необходимых пакетов..."
+sudo apt install -y --no-install-recommends samba rsync dosfstools parted avahi-daemon
+
+# 3. Включение gadget-режима
+BOOT_CFG="/boot/firmware/config.txt"
+[[ ! -f "$BOOT_CFG" ]] && BOOT_CFG="/boot/config.txt"
+
+grep -q "dtoverlay=dwc2,dr_mode=peripheral" "$BOOT_CFG" || \
+    echo "dtoverlay=dwc2,dr_mode=peripheral" | sudo tee -a "$BOOT_CFG" >/dev/null
+
+# 4. Создание/пересоздание образа
+if [[ -f "$IMG" ]]; then
+    read -p "Образ $IMG уже существует. Пересоздать? [y/N]: " -n 1 -r RECREATE_IMG
+    echo
+else
+    RECREATE_IMG=y
+fi
+
+if [[ $RECREATE_IMG =~ ^[Yy]$ ]]; then
+    echo "💾 Создаём образ ${IMG_SIZE_GB} ГБ..."
+    sudo rm -f "$IMG" 2>/dev/null || true
+    sudo truncate -s "${IMG_SIZE_GB}G" "$IMG"
+    sudo parted -s "$IMG" mklabel msdos
+    sudo parted -s "$IMG" mkpart primary fat32 2048s 100%
+    LOOP=$(sudo losetup -f --show -P "$IMG")
+    sudo mkfs.vfat -F 32 -n "DERMA" "${LOOP}p1"
+    sudo losetup -d "$LOOP"
+    sudo chmod 666 "$IMG"
+fi
+
+# 5. Скрипт USB gadget (libcomposite)
+cat <<'EOF' | sudo tee "$GADGET_SCRIPT" >/dev/null
+#!/usr/bin/env bash
+set -euo pipefail
+
+modprobe libcomposite || true
+
+GADGET_DIR="/sys/kernel/config/usb_gadget/derma_gadget"
+IMG="/home/pi/piusb.bin"
+
+[ -d "$GADGET_DIR" ] && { echo "" > "$GADGET_DIR/UDC" 2>/dev/null; rm -rf "$GADGET_DIR"; }
+
+mkdir -p "$GADGET_DIR"
+cd "$GADGET_DIR"
+
+echo 0x1d6b > idVendor
+echo 0x0104 > idProduct
+echo 0x0100 > bcdDevice
+echo 0x0200 > bcdUSB
+
+mkdir -p strings/0x409
+echo "0123456789ABCDEF" > strings/0x409/serialnumber
+echo "Dermatoscope Pi" > strings/0x409/manufacturer
+echo "Derma USB Drive" > strings/0x409/product
+
+mkdir -p configs/c.1/strings/0x409
+echo "Mass Storage" > configs/c.1/strings/0x409/configuration
+echo 250 > configs/c.1/MaxPower
+
+mkdir -p functions/mass_storage.usb0
+echo 0 > functions/mass_storage.usb0/lun.0/cdrom
+echo 0 > functions/mass_storage.usb0/lun.0/ro
+echo 1 > functions/mass_storage.usb0/lun.0/removable
+echo 0 > functions/mass_storage.usb0/lun.0/nofua
+echo "$IMG" > functions/mass_storage.usb0/lun.0/file
+
+ln -s functions/mass_storage.usb0 configs/c.1/
+
+UDC=$(ls /sys/class/udc/ | head -n1)
+[ -n "$UDC" ] && echo "$UDC" > UDC && echo "Gadget activated" || { echo "UDC not found!"; exit 1; }
+EOF
+
+sudo chmod +x "$GADGET_SCRIPT"
+sudo chown pi:pi "$GADGET_SCRIPT"
+
+# 6. Systemd-служба USB gadget
+cat <<EOF | sudo tee /etc/systemd/system/usb-gadget.service >/dev/null
 [Unit]
-Description=Watchdog for USB Share
-After=multi-user.target
+Description=USB Mass Storage Gadget
+After=local-fs.target
 
 [Service]
-Type=idle
-ExecStart=/usr/bin/python3 /usr/local/share/usbshare.py
+Type=oneshot
+ExecStart=$GADGET_SCRIPT
+RemainAfterExit=yes
 
 [Install]
 WantedBy=multi-user.target
-EOT
-)
-append_text_to_file "$usbshare_service_block" "/etc/systemd/system/usbshare.service" "[Unit]"
+EOF
 
-# Enable and start the service
 sudo systemctl daemon-reload
-sudo systemctl enable usbshare.service
-sudo systemctl start usbshare.service
+sudo systemctl enable usb-gadget.service
 
-# Feedback request for new hardware models
-if [ "$COMPATIBILITY_CHECK_PASSED" = false ]; then
-    echo "It looks like you ran this script on a different hardware model."
-    echo "If everything worked as expected, please consider creating a new issue in the repository:"
-    echo "https://github.com/mrfenyx/RPi-Zero-W-WiFi-USB"
-    echo "This will help us to update the list of known compatible models. Thank you!"
+# 7. Создание папки шары
+sudo mkdir -p "$SMB_DIR"
+sudo chown -R pi:pi "$SMB_DIR"
+sudo chmod -R 2775 "$SMB_DIR"
+
+# 8. Настройка Samba
+cat <<EOF | sudo tee /etc/samba/smb.conf >/dev/null
+[global]
+   workgroup = WORKGROUP
+   server string = Dermatoscope Pi
+   security = user
+   min protocol = SMB2
+   server min protocol = SMB2
+   dns proxy = no
+
+[$SHARE_NAME]
+   path = $SMB_DIR
+   browseable = yes
+   writable = yes
+   valid users = pi
+   read only = no
+   create mask = 0664
+   directory mask = 0775
+   force user = pi
+   force group = pi
+EOF
+
+# Установка пароля Samba
+(echo "$SAMBA_PASSWORD"; echo "$SAMBA_PASSWORD") | sudo smbpasswd -a pi >/dev/null 2>&1
+sudo smbpasswd -e pi
+
+sudo systemctl restart smbd nmbd
+
+# 9. Скрипт синхронизации
+cat <<EOF | sudo tee "$SYNC_SCRIPT" >/dev/null
+#!/usr/bin/env bash
+set -euo pipefail
+
+IMG="/home/pi/piusb.bin"
+MOUNT_PT="/mnt/usb_tmp"
+TARGET="$SMB_DIR"
+LOG="/home/pi/sync_usb.log"
+
+sudo mkdir -p "\$MOUNT_PT" "\$TARGET" 2>/dev/null || true
+
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] Запуск" >> "\$LOG"
+
+if mountpoint -q "\$MOUNT_PT"; then
+    sudo umount "\$MOUNT_PT" 2>>"\$LOG" || true
 fi
 
-# Optional reboot
-echo "Setup complete. It's recommended to reboot the system. Do you want to reboot now? (y/n)"
-read reboot_choice
-if [[ "$reboot_choice" =~ ^(yes|y)$ ]]; then
-  sudo reboot
+if sudo mount -o loop,ro,offset=\$((2048*512)) "\$IMG" "\$MOUNT_PT" 2>>"\$LOG"; then
+    rsync -av --update --exclude='System Volume Information' --exclude='found.*' \
+          "\$MOUNT_PT/" "\$TARGET/" >>"\$LOG" 2>&1
+    sync
+    sudo umount "\$MOUNT_PT" 2>>"\$LOG" || true
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] OK" >> "\$LOG"
 else
-  echo "Reboot cancelled. Please reboot manually later."
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Mount failed" >> "\$LOG"
 fi
+
+rmdir "\$MOUNT_PT" 2>/dev/null || true
+EOF
+
+sudo chmod +x "$SYNC_SCRIPT"
+sudo chown pi:pi "$SYNC_SCRIPT"
+
+# 10. Sudo без пароля
+echo 'pi ALL=(ALL) NOPASSWD: /bin/mount, /bin/umount' | sudo tee /etc/sudoers.d/99-usb-sync >/dev/null
+sudo chmod 0440 /etc/sudoers.d/99-usb-sync
+
+# 11. Cron с выбранным интервалом
+CRON_LINE="*/$SYNC_MINUTES * * * * $SYNC_SCRIPT >> /home/pi/cron.log 2>&1"
+(crontab -u pi -l 2>/dev/null || true; echo "$CRON_LINE") | crontab -u pi -
+
+# 12. Финальные настройки
+sudo iw wlan0 set power_save off 2>/dev/null || true
+sudo systemctl enable --now avahi-daemon
+
+echo
+echo "============================================================="
+echo "               Настройка завершена!"
+echo "============================================================="
+echo
+echo "• USB-образ:           $IMG (${IMG_SIZE_GB} ГБ)"
+echo "• Папка хранения:      $SMB_DIR"
+echo "• Сетевая шара:        \\\\$(hostname).local\\$SHARE_NAME"
+echo "• Доступ:              пользователь pi / пароль, который вы ввели"
+echo "• Синхронизация:       каждые $SYNC_MINUTES минут → $SMB_DIR"
+echo "• Логи:                /home/pi/sync_usb.log"
+echo
+echo "После перезагрузки подключите кабель к левому microUSB-порту."
+echo
+
+read -n1 -s -r -p "Перезагрузить сейчас? [y/N] " REPLY
+echo
+[[ $REPLY =~ ^[Yy]$ ]] && sudo reboot
